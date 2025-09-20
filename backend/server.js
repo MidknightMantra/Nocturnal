@@ -1,4 +1,4 @@
-// server.js - Nocturnal Backend (v2) - With Message Editing
+// server.js - Nocturnal Backend (v3) - With Delete for Everyone
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -8,7 +8,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const path = require('path');
 
-const getDb = require('./database'); // Import database
+const getDb = require('./database');
 const dbPromise = getDb();
 
 const app = express();
@@ -47,7 +47,10 @@ app.get('/messages/:senderId/:receiverId', async (req, res) => {
     const db = await dbPromise;
 
     const messages = await db.all(`
-      SELECT * FROM messages 
+      SELECT 
+        id, sender_id, receiver_id, content, type, 
+        status, edited, edited_at, deleted, deleted_at, timestamp 
+      FROM messages 
       WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
       ORDER BY timestamp ASC
     `, [senderId, receiverId, receiverId, senderId]);
@@ -63,7 +66,6 @@ app.get('/messages/:senderId/:receiverId', async (req, res) => {
 io.on('connection', (socket) => {
   console.log('🔌 User connected:', socket.id);
 
-  // Join user-specific room
   socket.on('join_user', async (userId) => {
     socket.join(`user_${userId}`);
     console.log(`👤 User ${userId} joined room user_${userId}`);
@@ -88,10 +90,10 @@ io.on('connection', (socket) => {
         type,
         timestamp: timestamp || new Date().toISOString(),
         status: 'sent',
-        edited: false
+        edited: false,
+        deleted: false
       };
 
-      // Emit to recipient
       io.to(`user_${receiver_id}`).emit('new_message', fullMessage);
       socket.emit('message_sent', fullMessage);
     } catch (err) {
@@ -100,19 +102,17 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ✏️ EDIT MESSAGE
+  // ✏️ Edit Message
   socket.on('edit_message', async (data) => {
-    const { message_id, sender_id, new_content, timestamp } = data;
+    const { message_id, sender_id, new_content } = data;
 
     const db = await dbPromise;
     try {
-      // Verify message belongs to sender
       const message = await db.get(`SELECT * FROM messages WHERE id = ? AND sender_id = ?`, [message_id, sender_id]);
       if (!message) {
         return socket.emit('edit_error', { error: 'Message not found or unauthorized' });
       }
 
-      // Update message
       await db.run(
         `UPDATE messages SET content = ?, edited = 1, edited_at = ? WHERE id = ?`,
         [new_content, new Date().toISOString(), message_id]
@@ -125,12 +125,49 @@ io.on('connection', (socket) => {
         edited_at: new Date().toISOString()
       };
 
-      // Broadcast edit to both sender and receiver
       io.to(`user_${message.receiver_id}`).emit('message_edited', updatedMessage);
       socket.emit('message_edited', updatedMessage);
     } catch (err) {
       console.error(err);
       socket.emit('edit_error', { error: 'Failed to edit message' });
+    }
+  });
+
+  // 🗑️ Delete for Everyone
+  socket.on('delete_for_everyone', async (data) => {
+    const { message_id, sender_id } = data;
+
+    const db = await dbPromise;
+    try {
+      // Verify ownership
+      const message = await db.get(`SELECT * FROM messages WHERE id = ? AND sender_id = ?`, [message_id, sender_id]);
+      if (!message) {
+        return socket.emit('delete_error', { error: 'Message not found or unauthorized' });
+      }
+
+      // Mark as deleted
+      await db.run(
+        `UPDATE messages SET deleted = 1, deleted_at = ?, content = '', type = 'deleted' WHERE id = ?`,
+        [new Date().toISOString(), message_id]
+      );
+
+      const deletedUpdate = {
+        id: message_id,
+        sender_id,
+        receiver_id: message.receiver_id,
+        content: null,
+        type: 'deleted',
+        timestamp: message.timestamp,
+        deleted: true,
+        deleted_at: new Date().toISOString()
+      };
+
+      // Notify both sides
+      io.to(`user_${message.receiver_id}`).emit('message_deleted', deletedUpdate);
+      socket.emit('message_deleted', deletedUpdate);
+    } catch (err) {
+      console.error(err);
+      socket.emit('delete_error', { error: 'Failed to delete message' });
     }
   });
 
