@@ -1,4 +1,4 @@
-// server.js - Nocturnal Backend (v3) - With Delete for Everyone
+// server.js - Nocturnal Backend (v4) - With Scheduled Messages
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -35,12 +35,72 @@ if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
 
+// In-memory timeout map to allow cancellation
+const scheduledTimeouts = new Map();
+
+// Function: Schedule a message
+const scheduleMessage = async (msg) => {
+  const now = new Date();
+  const sendTime = new Date(msg.scheduled_time);
+  const delay = Math.max(0, sendTime - now);
+
+  const timeout = setTimeout(async () => {
+    const db = await dbPromise;
+
+    try {
+      // Insert into main messages table
+      const result = await db.run(
+        `INSERT INTO messages (sender_id, receiver_id, content, type, timestamp) VALUES (?, ?, ?, ?, ?)`,
+        [msg.sender_id, msg.receiver_id, msg.content, msg.type, msg.scheduled_time]
+      );
+
+      const fullMessage = {
+        id: result.lastID,
+        sender_id: msg.sender_id,
+        receiver_id: msg.receiver_id,
+        content: msg.content,
+        type: msg.type,
+        timestamp: msg.scheduled_time,
+        status: 'sent',
+        edited: false,
+        deleted: false
+      };
+
+      // Mark as sent in scheduled table
+      await db.run(`UPDATE scheduled_messages SET status = 'sent' WHERE id = ?`, [msg.id]);
+
+      // Remove from timeouts
+      scheduledTimeouts.delete(msg.id);
+
+      // Emit to recipient
+      io.to(`user_${msg.receiver_id}`).emit('new_message', fullMessage);
+    } catch (err) {
+      console.error("Failed to send scheduled message:", err);
+      await db.run(`UPDATE scheduled_messages SET status = 'failed' WHERE id = ?`, [msg.id]);
+    }
+  }, delay);
+
+  scheduledTimeouts.set(msg.id, timeout);
+};
+
+// Load all pending scheduled messages on startup
+async function loadScheduledMessages() {
+  const db = await dbPromise;
+  const pending = await db.all(`
+    SELECT * FROM scheduled_messages 
+    WHERE status = 'pending' AND scheduled_time > ?
+  `, [new Date().toISOString()]);
+
+  pending.forEach(scheduleMessage);
+  console.log(`✅ Loaded ${pending.length} scheduled messages`);
+}
+
 // Routes
 app.get('/', (req, res) => {
   res.json({ message: "🌙 Nocturnal Server Running" });
 });
 
-// GET /messages/:sender/:receiver - Fetch chat history
+// GET /messages/:sender/:receiver
 app.get('/messages/:senderId/:receiverId', async (req, res) => {
   try {
     const { senderId, receiverId } = req.params;
@@ -139,13 +199,11 @@ io.on('connection', (socket) => {
 
     const db = await dbPromise;
     try {
-      // Verify ownership
       const message = await db.get(`SELECT * FROM messages WHERE id = ? AND sender_id = ?`, [message_id, sender_id]);
       if (!message) {
         return socket.emit('delete_error', { error: 'Message not found or unauthorized' });
       }
 
-      // Mark as deleted
       await db.run(
         `UPDATE messages SET deleted = 1, deleted_at = ?, content = '', type = 'deleted' WHERE id = ?`,
         [new Date().toISOString(), message_id]
@@ -162,12 +220,74 @@ io.on('connection', (socket) => {
         deleted_at: new Date().toISOString()
       };
 
-      // Notify both sides
       io.to(`user_${message.receiver_id}`).emit('message_deleted', deletedUpdate);
       socket.emit('message_deleted', deletedUpdate);
     } catch (err) {
       console.error(err);
       socket.emit('delete_error', { error: 'Failed to delete message' });
+    }
+  });
+
+  // 🕰️ Schedule a Message
+  socket.on('schedule_message', async (data) => {
+    const { sender_id, receiver_id, content, scheduled_time, type = 'text' } = data;
+
+    const db = await dbPromise;
+    try {
+      const result = await db.run(
+        `INSERT INTO scheduled_messages (sender_id, receiver_id, content, type, scheduled_time) VALUES (?, ?, ?, ?, ?)`,
+        [sender_id, receiver_id, content, type, scheduled_time]
+      );
+
+      const scheduledMsg = {
+        id: result.lastID,
+        sender_id,
+        receiver_id,
+        content,
+        type,
+        scheduled_time
+      };
+
+      scheduleMessage(scheduledMsg);
+
+      socket.emit('message_scheduled', {
+        id: scheduledMsg.id,
+        scheduled_time: scheduledMsg.scheduled_time,
+        status: 'pending'
+      });
+    } catch (err) {
+      console.error(err);
+      socket.emit('schedule_error', { error: 'Failed to schedule message' });
+    }
+  });
+
+  // ❌ Cancel Scheduled Message
+  socket.on('cancel_scheduled_message', async (data) => {
+    const { schedule_id, sender_id } = data;
+    const db = await dbPromise;
+
+    try {
+      const record = await db.get(
+        `SELECT * FROM scheduled_messages WHERE id = ? AND sender_id = ? AND status = 'pending'`,
+        [schedule_id, sender_id]
+      );
+
+      if (!record) {
+        return socket.emit('cancel_schedule_error', { error: 'Record not found or unauthorized' });
+      }
+
+      const timeout = scheduledTimeouts.get(schedule_id);
+      if (timeout) {
+        clearTimeout(timeout);
+        scheduledTimeouts.delete(schedule_id);
+      }
+
+      await db.run(`UPDATE scheduled_messages SET status = 'cancelled' WHERE id = ?`, [schedule_id]);
+
+      socket.emit('schedule_cancelled', { id: schedule_id });
+    } catch (err) {
+      console.error(err);
+      socket.emit('cancel_schedule_error', { error: 'Failed to cancel' });
     }
   });
 
@@ -177,16 +297,11 @@ io.on('connection', (socket) => {
   });
 });
 
-// Error Handling
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: "Something went wrong!" });
-});
-
 // Start Server
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`🚀 Nocturnal Server running on port ${PORT}`);
+  await loadScheduledMessages(); // Load pending schedules
 });
 
 module.exports = { app, io };
